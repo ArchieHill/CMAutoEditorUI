@@ -85,7 +85,7 @@ def run_startup_gui():
         ]], key='bbox_two_points', visible=False))],
         [sg.pin(sg.Column([
             [sg.Text('Select data within an arbitrary rectangle.')],
-            [sg.Text('The line between point 1 and 2 will be the W <-> E axis in CM.')],
+            [sg.Text('Point 1 will be the lower left corner in CM. From there enter the other corners of the rectangle in counter-clockwise order.')],
             [sg.Column([
                 [sg.Text('')],
                 [sg.Text('point 1')],
@@ -293,7 +293,17 @@ class OSMProcessor:
             if crs is None:
                 crs = crs_list[-1]
 
-        return crs.code
+            return crs.code
+        else:
+            return bbox_crs.to_epsg()
+
+    def _get_geometry(self, geojson_geometry):
+        try:
+            return shape(geojson_geometry)
+        except:
+            return None
+        
+
 
     def _get_projected_geometry(self, geojson_geometry):
             # geometry = geopandas.GeoSeries(shape(geojson_geometry))
@@ -301,14 +311,14 @@ class OSMProcessor:
             # geometry = geometry.to_crs(epsg=25832)
             # return geometry[0]
 
-            try:
-                geometry_object = shape(geojson_geometry)
-            except:
+            geometry_object = self._get_geometry(geojson_geometry)
+
+            if geometry_object is not None:
+                projected_geometry_object = transform(self.transformer.transform, geometry_object)
+
+                return projected_geometry_object
+            else:
                 return None
-
-            projected_geometry_object = transform(self.transformer.transform, geometry_object)
-
-            return projected_geometry_object
 
 
 
@@ -332,22 +342,32 @@ class OSMProcessor:
             epsg_code = self._get_epsg_code_from_bbox(bbox_crs=bbox_crs, bbox=bbox_polygon)
             bbox_from_data = False
         else:
-            epsg_code = 32632
+            epsg_code = None  # By default use WGS84/Transverse Mercator as in JOSM
             bbox_from_data = True
             xmin = np.inf
             xmax = -np.inf
             ymin = np.inf
             ymax = -np.inf
 
-        self.transformer = pyproj.Transformer.from_crs('epsg:4326', 'epsg:{}'.format(epsg_code), always_xy=True)
-
-
+        self.transformer = None
+        if epsg_code is not None:
+            self.transformer = pyproj.Transformer.from_crs('epsg:4326', 'epsg:{}'.format(epsg_code), always_xy=True)
+            
 
         element_idx = 0
         unprocessed_tags = {'key': [], 'value': []}
         for element in tqdm(osm_data.features, 'Preprocessing OSM Data'):
             element_matched = False
+            if bbox_from_data and epsg_code is None:
+                raw_geometry = self._get_geometry(element.geometry)
+                if raw_geometry is not None:
+                    epsg_code = self._get_epsg_code_from_bbox(bbox_crs=CRS.from_epsg(4326), bbox=raw_geometry)
+                    self.transformer = pyproj.Transformer.from_crs('epsg:4326', 'epsg:{}'.format(epsg_code), always_xy=True)
+                else:
+                    continue
+
             geometry = self._get_projected_geometry(element.geometry)
+
             if geometry is None:
                 continue
 
@@ -417,13 +437,14 @@ class OSMProcessor:
                 bbox_polygon = Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
             else:
                 bbox_polygon = transform(self.transformer.transform, bbox_polygon)
+            
             self._init_grid(bbox_polygon)
 
         # add default entries
-        if "default_ground" in config:
+        if "default_ground" in config and (True if not 'active' in config['default_ground'] else config['default_ground']['active']):
             self.matched_elements.append({'element': None, 'geometry': self.effective_bbox_polygon, 
                                           'name': 'default_ground', 'idx': element_idx + 1})
-        if "default_foliage" in config:
+        if "default_foliage" in config and (True if not 'active' in config['default_foliage'] else config['default_foliage']['active']):
             self.matched_elements.append({'element': None, 'geometry': self.effective_bbox_polygon, 
                                           'name': 'default_foliage', 'idx': element_idx + 2})
 
@@ -485,50 +506,86 @@ class OSMProcessor:
         self.df = self.df.drop_duplicates()
         self.df = self.df.drop(self.df[(self.df.menu == -1) & (self.df.z == -1)].index)
 
-        duplicate_indices = self.df[self.df.duplicated(subset=['xidx', 'yidx'])].index
+        # duplicate_indices = self.df[self.df.duplicated(subset=['xidx', 'yidx'])].index
         indices_to_drop = []
-        for idx in duplicate_indices:
-            xidx = self.df.loc[idx].xidx
-            yidx = self.df.loc[idx].yidx
 
-            # min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx)].priority.max()
-            contains_default = len(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == -999)]) > 0
-
-            if contains_default:
-                min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > -999)].priority.min()
-            else:
-                min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > 0)].priority.min()
-            # if min_valid_priority < 1:
-            #     continue
-            if np.isnan(min_valid_priority):
+        for _, group in tqdm(self.df.groupby(by=['xidx', 'yidx']), 'Postprocessing OSM Data'):
+            if len(group) < 2:
                 continue
+            indices_to_drop_in_group = []
+            indices_to_drop_in_group.extend(group[group.priority == -999].index)
+            min_priority = group[group.priority > 0].priority.min()
+            if min_priority > 0:
+                indices_to_drop_in_group.extend(group[group.priority > min_priority].index)
+                indices_to_drop_in_group.extend(group[(group.priority < 0) & (group.priority > -999)].index)
 
-            if contains_default:
-                indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == -999)].index)
-            else:
-                indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > min_valid_priority)].index)
-                indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority < 0)].index)
+            surviving_group = group[~group.index.isin(indices_to_drop_in_group)]
+            if len(surviving_group) > 1:
+                for _, prio_group in surviving_group.groupby(by=['priority', 'name']):
+                    if len(prio_group) == 1:
+                        continue
+                    priority_names = prio_group.name.unique()
 
-            min_priority_names = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority)].name.unique()
+                    for name in priority_names:
+                        indices = prio_group[(prio_group.name == name)].index
+                        cm_types = self.config[name]['cm_types']
+                        indices_with_cm_rank = []
+                        for sub_idx in indices:
+                            menu = prio_group.loc[sub_idx].menu
+                            cat1 = prio_group.loc[sub_idx].cat1
+                            cat2 = prio_group.loc[sub_idx].cat2
 
-            for name in min_priority_names:
-                if len(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority) & (self.df.name == name)]) > 1:
-                    indices = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority) & (self.df.name == name)].index
-                    cm_types = self.config[name]['cm_types']
-                    indices_with_cm_rank = []
-                    for sub_idx in indices:
-                        menu = self.df.loc[sub_idx].menu
-                        cat1 = self.df.loc[sub_idx].cat1
-                        cat2 = self.df.loc[sub_idx].cat2
+                            for cidx, cm_type in enumerate(cm_types):
+                                if cm_type['menu'] == menu and cm_type['cat1'] == cat1 and (cat2 not in cm_type or ('cat2' in cm_type and cm_type['cat2'] == cat2)):
+                                    indices_with_cm_rank.append((sub_idx, cidx))
+                                    break
+                        indices_with_rank = [sub_idx[0] for sub_idx in sorted(indices_with_cm_rank, key=lambda x: x[1])[1:]]
+                        indices_to_drop_in_group.extend(indices_with_rank)
 
-                        for cidx, cm_type in enumerate(cm_types):
-                            if cm_type['menu'] == menu and cm_type['cat1'] == cat1 and (cat2 not in cm_type or ('cat2' in cm_type and cm_type['cat2'] == cat2)):
-                                indices_with_cm_rank.append((sub_idx, cidx))
-                                break
-                    indices_with_rank = [sub_idx[0] for sub_idx in sorted(indices_with_cm_rank, key=lambda x: x[1])[1:]]
-                    indices_to_drop.extend(indices_with_rank)
-                else:
-                    pass
+            indices_to_drop.extend(indices_to_drop_in_group)
+
+        # for idx in tqdm(duplicate_indices, 'Postprocessing OSM Data'):
+        #     xidx = self.df.loc[idx].xidx
+        #     yidx = self.df.loc[idx].yidx
+
+        #     # min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx)].priority.max()
+        #     contains_default = len(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == -999)]) > 0
+
+        #     if contains_default:
+        #         min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > -999)].priority.min()
+        #     else:
+        #         min_valid_priority = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > 0)].priority.min()
+        #     # if min_valid_priority < 1:
+        #     #     continue
+        #     if np.isnan(min_valid_priority):
+        #         continue
+
+        #     if contains_default:
+        #         indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == -999)].index)
+        #     else:
+        #         indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority > min_valid_priority)].index)
+        #         indices_to_drop.extend(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority < 0)].index)
+
+        #     min_priority_names = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority)].name.unique()
+
+        #     for name in min_priority_names:
+        #         if len(self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority) & (self.df.name == name)]) > 1:
+        #             indices = self.df[(self.df.xidx == xidx) & (self.df.yidx == yidx) & (self.df.priority == min_valid_priority) & (self.df.name == name)].index
+        #             cm_types = self.config[name]['cm_types']
+        #             indices_with_cm_rank = []
+        #             for sub_idx in indices:
+        #                 menu = self.df.loc[sub_idx].menu
+        #                 cat1 = self.df.loc[sub_idx].cat1
+        #                 cat2 = self.df.loc[sub_idx].cat2
+
+        #                 for cidx, cm_type in enumerate(cm_types):
+        #                     if cm_type['menu'] == menu and cm_type['cat1'] == cat1 and (cat2 not in cm_type or ('cat2' in cm_type and cm_type['cat2'] == cat2)):
+        #                         indices_with_cm_rank.append((sub_idx, cidx))
+        #                         break
+        #             indices_with_rank = [sub_idx[0] for sub_idx in sorted(indices_with_cm_rank, key=lambda x: x[1])[1:]]
+        #             indices_to_drop.extend(indices_with_rank)
+        #         else:
+        #             pass
         
         if len(indices_to_drop) > 0:
             self.df = self.df.drop(indices_to_drop)
